@@ -1,18 +1,16 @@
 # SiftFuzz
 
-SiftFuzz is a **structure-driven triage module** designed to enhance coverage-guided fuzzers by incorporating **structural analysis and differential fusion**. It prioritizes and merges inputs based on their **structural uniqueness**, enabling **fine-grained deduplication** and **structure-aware recombination**.
+SiftFuzz is a structure-driven triage module designed to enhance coverage-guided fuzzers by incorporating structural analysis and differential fusion. It prioritizes and merges inputs based on their structural uniqueness, enabling fine-grained deduplication and structure-aware recombination.
 
-This repository provides the **core implementation** of SiftFuzz’s structural triage logic, **excluding integration code** with fuzzers such as AFL/AFL++.
+## Highlights
 
-## 🌟 Highlights
+- Locality-sensitive structural feature matching for fast similarity detection.
+- MinHash signature computation and chunk-wise feature bucketing.
+- Differential fusion based on Myers diff and file format detection.
+- Penalized Hamming similarity and trace-level similarity comparison.
+- Designed as a pluggable, lightweight component with minimal dependencies.
 
-- **Locality-sensitive structural feature matching** for fast similarity detection.
-- **MinHash signature computation** and chunk-wise feature bucketing.
-- **Differential fusion** based on Myers diff and file format detection.
-- **Penalized Hamming similarity** and trace-level similarity comparison.
-- Designed as a **pluggable, lightweight component** with minimal dependencies.
-
-## 📁 Repository Structure
+## Repository Structure
 
 | File           | Description                                    |
 | -------------- | ---------------------------------------------- |
@@ -80,7 +78,7 @@ If you use SiftFuzz in your work, please consider citing:
 
 ## 🔚 Limitations and Future Work
 
-- This repo provides **only the core logic**, without ready-to-use integration with fuzzers like AFL++.
+- The integration part is not included for now, but will be added in future updates.
 
 <!-- ## 🔓 License
 
