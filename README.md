@@ -6,7 +6,7 @@ SiftFuzz is a structure-driven triage module designed to enhance coverage-guided
 
 - Locality-sensitive structural feature matching for fast similarity detection.
 - MinHash signature computation and chunk-wise feature bucketing.
-- Differential fusion based on Myers diff and file format detection.
+- Differential fusion based on format detection and differential binary sequences.
 - Penalized Hamming similarity and trace-level similarity comparison.
 - Designed as a pluggable, lightweight component with minimal dependencies.
 
