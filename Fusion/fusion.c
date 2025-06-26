@@ -1,181 +1,159 @@
 #include "afl-fuzz.h"
 #include "fusion.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <ctype.h>
 
 u32 fusion_round = 20;
-
-
 u32 total_fusion_to_queue = 0;
-struct bucket_node* FeaturePool[MINHASH_BUCKETS] = {NULL};
 
+const uint32_t CHUNKS_PER_POOL[SUBPOOL_CNT] = { 8, 16, 32 };
+const uint32_t LEN_THRESHOLD[SUBPOOL_CNT-1] = { 32 * 1024, 128 * 1024 };
 
-uint32_t compute_chunk_hash(uint32_t* sig_chunk) {
-    return murmur3_32((uint8_t*)sig_chunk, CHUNK_LEN * 4, 0xABCD1234) % MINHASH_BUCKETS;
-}
-  
+static feature_subpool_t HFeaturePool[SUBPOOL_CNT];
 
 static inline uint32_t murmur3_32(const uint8_t* key, size_t len, uint32_t seed) {
   uint32_t h = seed;
-  const uint32_t c1 = 0xcc9e2d51;
-  const uint32_t c2 = 0x1b873593;
-
-  const int nblocks = len / 4;
-  const uint32_t* blocks = (const uint32_t*)(key);
-  for (int i = 0; i < nblocks; i++) {
-    uint32_t k = blocks[i];
-    k *= c1; k = (k << 15) | (k >> 17); k *= c2;
-    h ^= k; h = (h << 13) | (h >> 19); h = h * 5 + 0xe6546b64;
+  if (len > 3) {
+    const uint32_t *key_x4 = (const uint32_t *) key;
+    size_t i = len >> 2;
+    do {
+      uint32_t k = *key_x4++;
+      k *= 0xcc9e2d51;
+      k = (k << 15) | (k >> 17);
+      k *= 0x1b873593;
+      h ^= k;
+      h = (h << 13) | (h >> 19);
+      h = (h * 5) + 0xe6546b64;
+    } while (--i);
+    key = (const uint8_t *) key_x4;
   }
-
-  const uint8_t* tail = (const uint8_t*)(key + nblocks * 4);
-  uint32_t k1 = 0;
-  switch (len & 3) {
-    case 3: k1 ^= tail[2] << 16;
-    case 2: k1 ^= tail[1] << 8;
-    case 1: k1 ^= tail[0]; k1 *= c1; k1 = (k1 << 15) | (k1 >> 17); k1 *= c2; h ^= k1;
+  if (len & 3) {
+    size_t i = len & 3;
+    uint32_t k = 0;
+    key = &key[i - 1];
+    do {
+      k <<= 8;
+      k |= *key--;
+    } while (--i);
+    k *= 0xcc9e2d51;
+    k = (k << 15) | (k >> 17);
+    k *= 0x1b873593;
+    h ^= k;
   }
-
   h ^= len;
   h ^= h >> 16;
   h *= 0x85ebca6b;
   h ^= h >> 13;
   h *= 0xc2b2ae35;
   h ^= h >> 16;
-
   return h;
 }
-  
 
-void compute_minhash_signature(u8* data, u32 len, u32 signature_out[MINHASH_DIM]) {
-
-  const u32 window_size = 16;   
-  const u32 step_size = 8;     
-
+void compute_minhash_signature(u8* data, u32 len, u32 sig_out[MINHASH_DIM]) {
   for (u32 i = 0; i < MINHASH_DIM; i++) {
-      signature_out[i] = 0xffffffff;
-  }
-
-  if (len < window_size) return;
-
-  for (u32 offset = 0; offset + window_size <= len; offset += step_size) {
-
-      u8* window = data + offset;
-
-      u32 base_hash = murmur3_32(window, window_size, 0x12345678);
-
-      for (u32 j = 0; j < MINHASH_DIM; j++) {
-          u32 h = murmur3_32((u8*)&base_hash, 4, j * 0x9e3779b9);
-          if (h < signature_out[j]) {
-              signature_out[j] = h;
-          }
-      }
+    sig_out[i] = murmur3_32(data, len, i * 0x45d9f3b);
   }
 }
 
-float hamming_similarity_weighted(BinData a, BinData b) {
-  uint32_t min_len = (a.len < b.len) ? a.len : b.len;
-  uint32_t max_len = (a.len > b.len) ? a.len : b.len;
-  float penalty_factor = (float)min_len / (float)max_len;
-
-  uint32_t dist = 0;
-
-  for (uint32_t i = 0; i < min_len; i++) {
-      uint8_t diff = a.data[i] ^ b.data[i];
-      while (diff) {
-          dist += diff & 1;
-          diff >>= 1;
-      }
+static void init_feature_pools(void) {
+  for (uint32_t i = 0; i < SUBPOOL_CNT; ++i) {
+    HFeaturePool[i].chunk_cnt = CHUNKS_PER_POOL[i];
+    HFeaturePool[i].chunk_len = MINHASH_DIM / CHUNKS_PER_POOL[i];
+    for (uint32_t b = 0; b < MINHASH_BUCKETS; ++b)
+      HFeaturePool[i].buckets[b] = NULL;
   }
-
-  uint32_t extra_bytes = max_len - min_len;
-  uint32_t penalty = (uint32_t)(8.0 * extra_bytes * penalty_factor);
-
-  uint32_t total_possible = max_len * 8; 
-  uint32_t total_distance = dist + penalty;
-
-  return 1.0f - ((float)total_distance / total_possible);
 }
 
-struct queue_entry* find_similar_path_entry(afl_state_t *afl) {
+__attribute__((constructor))
+static void __fusion_init(void) { init_feature_pools(); }
 
-  if (!afl || !afl->queue_buf || afl->queued_items == 0) return NULL;
-
-  u32 attempts = 0;
-
-  while (attempts < 3) {  
-    u32 idx = rand() % afl->queued_items;
-    struct queue_entry *q = afl->queue_buf[idx];
-    if (q && q != afl->queue_cur) {
-      return q;
+void destroy_feature_pool(void) {
+  for (uint32_t p = 0; p < SUBPOOL_CNT; ++p) {
+    for (uint32_t b = 0; b < MINHASH_BUCKETS; ++b) {
+      bucket_node_t *node = HFeaturePool[p].buckets[b];
+      while (node) {
+        bucket_node_t *nxt = node->next_in_bucket;
+        ck_free(node);
+        node = nxt;
+      }
+      HFeaturePool[p].buckets[b] = NULL;
     }
-    attempts++;
   }
-
-  return NULL;
 }
 
+void add_to_feature_pool(struct queue_entry *q) {
+  for (uint32_t p = 0; p < SUBPOOL_CNT; ++p) {
+    uint32_t M = HFeaturePool[p].chunk_cnt;
+    uint32_t len = HFeaturePool[p].chunk_len;
+    uint8_t seen[MINHASH_BUCKETS] = {0};
+    for (uint32_t c = 0; c < M; ++c) {
+      uint32_t *chunk = &q->minhash_signature[c * len];
+      uint32_t bucket = murmur3_32((uint8_t*)chunk, len * 4, 0xABCD1234) % MINHASH_BUCKETS;
+      if (seen[bucket]) continue;
+      seen[bucket] = 1;
+      bucket_node_t *node = ck_alloc(sizeof(bucket_node_t));
+      node->q = q;
+      node->next_in_bucket = HFeaturePool[p].buckets[bucket];
+      HFeaturePool[p].buckets[bucket] = node;
+    }
+  }
+}
+
+static uint32_t pick_pool_priority(u32 len) {
+  if (len < LEN_THRESHOLD[0]) return 0;
+  if (len < LEN_THRESHOLD[1]) return 1;
+  return 2;
+}
 
 struct queue_entry* binary_structure_duplicated_filter(afl_state_t* afl, u8* data, u32 len) {
-
   uint32_t sig[MINHASH_DIM];
   compute_minhash_signature(data, len, sig);
-
-  for (int i = 0; i < BUCKET_CHUNKS; i++) {
-    uint32_t* chunk = &sig[i * CHUNK_LEN];
-    uint32_t bucket_id = murmur3_32((uint8_t*)chunk, CHUNK_LEN * 4, 0xABCD1234) % MINHASH_BUCKETS;
-
-    struct bucket_node* node = FeaturePool[bucket_id];
-    while (node) {
-      struct queue_entry* cur = node->q;
-
-      if (cur->seen_flag) {
-        node = node->next_in_bucket;
-        continue;
-      }
-      cur->seen_flag = 1;
-
-      int fd = open((const char*)cur->fname, O_RDONLY);
-      if (fd < 0) {
-        node = node->next_in_bucket;
-        continue;
-      }
-
-      struct stat st;
-      if (fstat(fd, &st) < 0 || st.st_size == 0) {
-        close(fd);
-        node = node->next_in_bucket;
-        continue;
-      }
-
-      u8* other_data = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-      close(fd);
-      if (other_data == MAP_FAILED) {
-        node = node->next_in_bucket;
-        continue;
-      }
-
-      BinData a = { .data = data, .len = len };
-      BinData b = { .data = other_data, .len = st.st_size };
-
-      float sim = hamming_similarity_weighted(a, b);
-
-      munmap(other_data, st.st_size);
-
-      if (sim > 0.8) {
-        for (u32 i = 0; i < afl->queued_items; i++) {
-          afl->queue_buf[i]->seen_flag = 0;
+  uint32_t first = pick_pool_priority(len);
+  for (uint32_t round = 0; round < SUBPOOL_CNT; ++round) {
+    uint32_t pidx = (first + round) % SUBPOOL_CNT;
+    feature_subpool_t *pool = &HFeaturePool[pidx];
+    for (uint32_t c = 0; c < pool->chunk_cnt; ++c) {
+      uint32_t *chunk = &sig[c * pool->chunk_len];
+      uint32_t bucket = murmur3_32((uint8_t*)chunk, pool->chunk_len * 4, 0xABCD1234) % MINHASH_BUCKETS;
+      bucket_node_t *node = pool->buckets[bucket];
+      while (node) {
+        struct queue_entry *cur = node->q;
+        if (cur->seen_flag) {
+          node = node->next_in_bucket;
+          continue;
         }
-        return NULL;  
+        cur->seen_flag = 1;
+        int fd = open((const char*)cur->fname, O_RDONLY);
+        if (fd < 0) {
+          node = node->next_in_bucket;
+          continue;
+        }
+        struct stat st;
+        if (fstat(fd, &st) < 0 || st.st_size == 0) {
+          close(fd);
+          node = node->next_in_bucket;
+          continue;
+        }
+        u8* other = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (other == MAP_FAILED) {
+          node = node->next_in_bucket;
+          continue;
+        }
+        float sim = hamming_similarity_weighted((BinData){data, len}, (BinData){other, st.st_size});
+        munmap(other, st.st_size);
+        if (sim > 0.80f) {
+          for (u32 i = 0; i < afl->queued_items; i++) afl->queue_buf[i]->seen_flag = 0;
+          return NULL;
+        }
+        node = node->next_in_bucket;
       }
-
-      node = node->next_in_bucket;
     }
   }
-
-  for (u32 i = 0; i < afl->queued_items; i++) {
-    afl->queue_buf[i]->seen_flag = 0;
-  }
-  struct queue_entry *match = find_similar_path_entry(afl);
-  return match;
+  for (u32 i = 0; i < afl->queued_items; i++) afl->queue_buf[i]->seen_flag = 0;
+  return find_similar_path_entry(afl);
 }
 
 int detect_format(struct queue_entry* q) {
