@@ -16,7 +16,7 @@ SiftFuzz is a structure-driven triage module designed to enhance coverage-guided
 | ----------- | ------------------------------------------------------ |
 | `Fusion/`   | Core logic: structural triage, similarity detection, fusion |
 | `Fuzzer/`   | Docker-based build system for 5 major fuzzers with auto-injection |
-| `README.md` | This file   
+| `README.md` | Project overview, and build guide   
 
 > 🔧 Note: You will need to integrate this module manually with your fuzzer (e.g., AFL++) by invoking the provided triage and fusion functions in your `afl-fuzz.c` logic, particularly around the seed evaluation and corpus admission stages.
 > The integration part is **not included** for now, but will be added in future updates.
